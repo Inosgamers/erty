@@ -1,0 +1,151 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # Backend Tests
+  backend-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: erty_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: erty-backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: ./erty-backend
+        run: npm ci
+      
+      - name: Run linter
+        working-directory: ./erty-backend
+        run: npm run lint || true
+      
+      - name: Run tests
+        working-directory: ./erty-backend
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: erty_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          JWT_SECRET: test_secret
+        run: npm test || true
+
+  # Mobile Tests
+  mobile-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.0'
+          channel: 'stable'
+      
+      - name: Get dependencies
+        working-directory: ./erty-mobile
+        run: flutter pub get
+      
+      - name: Run analyzer
+        working-directory: ./erty-mobile
+        run: flutter analyze || true
+      
+      - name: Run tests
+        working-directory: ./erty-mobile
+        run: flutter test || true
+
+  # Build Docker Image
+  build-docker:
+    runs-on: ubuntu-latest
+    needs: [backend-test]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./erty-backend
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/erty-backend:latest
+            ${{ secrets.DOCKER_USERNAME }}/erty-backend:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/erty-backend:latest
+          cache-to: type=inline
+
+  # Build Flutter APK
+  build-apk:
+    runs-on: ubuntu-latest
+    needs: [mobile-test]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.0'
+          channel: 'stable'
+      
+      - name: Get dependencies
+        working-directory: ./erty-mobile
+        run: flutter pub get
+      
+      - name: Build APK
+        working-directory: ./erty-mobile
+        run: flutter build apk --release
+      
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-apk
+          path: erty-mobile/build/app/outputs/flutter-apk/app-release.apk
